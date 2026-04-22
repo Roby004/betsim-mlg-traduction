@@ -1,103 +1,183 @@
 import re
+import torch
+import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import List
 from transformers import T5ForConditionalGeneration, T5Tokenizer
-import torch
 
-class TranslationRequest(BaseModel):
-    text: str
+app = FastAPI(title="Betsimisaraka Translation API", version="2.6")
 
-app = FastAPI()
-
-origins = [
-    "*",
-]
+# Configuration CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Model repo names
-repo_bmm_mg = "Amboara001/bmm-to-mg-t5-base-v3"
-repo_mg_bmm = "Amboara001/malagasy-to-betsim-t5-base-translator"
-#hf_token = "nlpmodel"  # Replace with your actual Hugging Face token if needed
+class TranslationRequest(BaseModel):
+    text: str
+
+# --- Configuration des Modèles ---
+MODELS_CONFIG = {
+    "bmm_to_plt": "Amboara001/bmm-to-plt-t5-norm-aug",
+    "mg_to_plt": "Amboara001/plt-to-bmm-t5-v3"
+}
+
+TASK_PREFIX_BMM_MG = "translate Betsimisaraka to Malagasy: "
+TASK_PREFIX_MG_BMM = "translate Malagasy to Betsimisaraka: "
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
-# Load both models and tokenizers
+models = {}
+tokenizers = {}
+
 try:
-    model_bmm_mg = T5ForConditionalGeneration.from_pretrained(repo_bmm_mg).to(device)
-    tokenizer_bmm_mg = T5Tokenizer.from_pretrained(repo_bmm_mg)
-    model_mg_bmm = T5ForConditionalGeneration.from_pretrained(repo_mg_bmm).to(device)
-    tokenizer_mg_bmm = T5Tokenizer.from_pretrained(repo_mg_bmm)
-    print("Both models and tokenizers loaded successfully from Hugging Face Hub.")
+    for key, repo in MODELS_CONFIG.items():
+        tokenizers[key] = T5Tokenizer.from_pretrained(repo)
+        models[key] = T5ForConditionalGeneration.from_pretrained(repo).to(device)
+        models[key].eval()
+    print("Modèles chargés avec succès.")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    raise HTTPException(status_code=500, detail="Could not load the translation models.")
+    print(f"Erreur de chargement : {e}")
 
-TASK_PREFIX_BMM_MG = "translate Betsimisaraka to official Malagasy: "
-TASK_PREFIX_MG_BMM = "translate official Malagasy to Betsimisaraka: "
+# --- Fonctions de Traitement Améliorées ---
+
+def normalize_sentence_case(text: str) -> str:
+    """
+    Force une majuscule :
+    - au début du texte
+    - après . ? ! ...
+    - après les sauts de ligne
+    """
+    text = text.strip()
+
+    if not text:
+        return text
+
+    # 1.Majuscule au tout début de la phrase
+    text = text[0].upper() + text[1:]
+
+    # 2. Majuscule après ponctuation forte ou saut de ligne
+    def capitalize_match(match):
+        return match.group(1) + match.group(2).upper()
+
+    text = re.sub(
+        r'([.!?…]+[\s\n]+)([a-zàâäçéèêëîïôöùûü])',
+        capitalize_match,
+        text,
+        flags=re.UNICODE
+    )
+
+    # 3. Majuscule après saut de ligne seul
+    text = re.sub(
+        r'(\n+)([a-zàâäçéèêëîïôöùûü])',
+        capitalize_match,
+        text,
+        flags=re.UNICODE
+    )
+
+    return text
+
+
+def clean_bmm_line(line: str) -> str:
+    """Nettoyage par ligne pour préserver la structure globale."""
+    if not line.strip():
+        return line
+    line = line.lower()
+    line = line.replace('ô', 'o').replace('ñ', 'gn')
+    replacements = {"zagny": "zegny", "zany": "zegny", "ôlogno": "olo", "olona": "olo", "tragno": "trano"}
+    words = [replacements.get(w, w) for w in line.split()]
+    return " ".join(words)
 
 @torch.inference_mode()
-def translate_sentence(text: str, model, tokenizer, task_prefix, max_new_tokens=128, num_beams=5):
-    prompt = task_prefix + text
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True).to(device)
-    out = model.generate(**inputs, max_new_tokens=max_new_tokens, num_beams=num_beams)
-    return tokenizer.decode(out[0], skip_special_tokens=True)
+def translate_batch(sentences: List[str], model_key: str, prefix: str) -> List[str]:
+    if not sentences: return []
+    
+    model = models[model_key]
+    tokenizer = tokenizers[model_key]
+    prompts = [f"{prefix}{s}" for s in sentences]
+    
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(device)
+    outputs = model.generate(**inputs, max_new_tokens=128, num_beams=5)
+    
+    return [tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
 
-def translate_paragraph(paragraph: str, model, tokenizer, task_prefix):
-    parts = re.split(r'(\n|[.!?;])', paragraph)
-    translated = []
-    buffer = ""
+async def process_translation(text: str, mode: str, prefix: str):
+    """
+    Gère le découpage en préservant strictement les sauts de lignes 
+    et la ponctuation pour les deux sens de traduction.
+    """
+    
+    parts = re.split(r'([.!?;]+|\n+)', text)
+    
+    segments_to_translate = []
+    structure = [] # Garde la trace de quoi est un texte (ID) et quoi est un séparateur (STR)
+
     for part in parts:
-        if part in ['\n', '.', '!', '?', ';']:
-            if buffer.strip():
-                translated.append(translate_sentence(buffer.strip(), model, tokenizer, task_prefix))
-                buffer = ""
-            translated.append(part)
+        if not part: continue
+        
+        # Si la partie ne contient que de la ponctuation ou des sauts de ligne
+        if re.match(r'^[.!?; \n\r]+$', part):
+            structure.append({'type': 'sep', 'content': part})
         else:
-            buffer += part
-    if buffer.strip():
-        translated.append(translate_sentence(buffer.strip(), model, tokenizer, task_prefix))
-    result = ""
-    for t in translated:
-        if t in ['\n', '.', '!', '?', ';']:
-            result = result.rstrip() + t
+            # C'est du texte à traduire
+            clean_text = part.strip()
+            if mode == "bmm_to_plt":
+                clean_text = clean_bmm_line(clean_text)
+            
+            if clean_text:
+                segments_to_translate.append(clean_text)
+                structure.append({'type': 'text', 'id': len(segments_to_translate) - 1})
+            else:
+                structure.append({'type': 'sep', 'content': part})
+
+    # 2. Traduction par lot
+    if segments_to_translate:
+        loop = asyncio.get_event_loop()
+        translated_list = await loop.run_in_executor(
+            None, translate_batch, segments_to_translate, mode, prefix
+        )
+    else:
+        translated_list = []
+
+    # 3. Reconstruction fidèle
+    final_output = []
+    for item in structure:
+        if item['type'] == 'sep':
+            final_output.append(item['content'])
         else:
-            result += " " + t
-    return result.strip()
+            final_output.append(translated_list[item['id']])
 
-@app.post("/translate-bmm-to-mg")
-async def translate_bmm_to_mg(request: TranslationRequest):
-    text_to_translate = request.text
-    if not text_to_translate:
-        raise HTTPException(status_code=400, detail="No text provided")
+    final_text = "".join(final_output)
+    
+    final_text = normalize_sentence_case(final_text)
+
+    return final_text
+
+# --- Endpoints ---
+
+@app.post("/translate-bmm-to-plt")
+async def bmm_to_plt(request: TranslationRequest):
+    if not request.text: raise HTTPException(status_code=400, detail="Texte vide")
     try:
-        translated_text = translate_paragraph(
-            text_to_translate, model_bmm_mg, tokenizer_bmm_mg, TASK_PREFIX_BMM_MG
-        )
-        return {"translated_text": translated_text}
+        translated = await process_translation(request.text, "bmm_to_plt", TASK_PREFIX_BMM_MG)
+        return {"translated_text": translated}
     except Exception as e:
-        print(f"An error occurred: {e}")
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/translate-mg-to-bmm")
-async def translate_mg_to_bmm(request: TranslationRequest):
-    text_to_translate = request.text
-    if not text_to_translate:
-        raise HTTPException(status_code=400, detail="No text provided")
+@app.post("/translate-plt-to-bmm")
+async def mg_to_bmm(request: TranslationRequest):
+    if not request.text: raise HTTPException(status_code=400, detail="Texte vide")
     try:
-        translated_text = translate_paragraph(
-            text_to_translate, model_mg_bmm, tokenizer_mg_bmm, TASK_PREFIX_MG_BMM
-        )
-        return {"translated_text": translated_text}
+        translated = await process_translation(request.text, "mg_to_plt", TASK_PREFIX_MG_BMM)
+        return {"translated_text": translated}
     except Exception as e:
-        print(f"An error occurred: {e}")
-        raise HTTPException(status_code=500, detail="An internal server error occurred.")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# To run: uvicorn main:app --reload
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
